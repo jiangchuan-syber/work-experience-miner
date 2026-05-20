@@ -6,6 +6,7 @@ DeepSeek Chat API（OpenAI 兼容协议）。
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from typing import Any
 
 
@@ -16,6 +17,54 @@ def load_dotenv_if_present() -> None:
         load_dotenv()
     except ImportError:
         pass
+
+
+def _openai_client():
+    load_dotenv_if_present()
+    api_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    if not api_key:
+        msg = "缺少环境变量 DEEPSEEK_API_KEY（可在项目根目录创建 .env 并填写）"
+        raise ValueError(msg)
+    base_url = (os.environ.get("DEEPSEEK_API_BASE") or "https://api.deepseek.com").strip()
+    base_url = base_url.rstrip("/")
+    from openai import OpenAI
+
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
+def _normalize_conv(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    conv: list[dict[str, str]] = []
+    for mo in messages:
+        role = (mo.get("role") or "").strip()
+        raw = mo.get("content")
+        body = raw.strip() if isinstance(raw, str) else str(raw or "").strip()
+        if role not in {"user", "assistant"} or not body:
+            continue
+        conv.append({"role": role, "content": body})
+    return conv
+
+
+def _chat_request(
+    system_prompt: str,
+    messages: list[dict[str, Any]],
+    *,
+    model: str | None = None,
+    temperature: float = 0.7,
+    max_tokens: int | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    m = (model or os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash").strip()
+    conv = _normalize_conv(messages)
+    req: dict[str, Any] = {
+        "model": m,
+        "messages": [
+            {"role": "system", "content": system_prompt or "You are a helpful assistant."},
+            *conv,
+        ],
+        "temperature": temperature,
+    }
+    if max_tokens is not None:
+        req["max_tokens"] = max_tokens
+    return _openai_client(), req
 
 
 def deepseek_chat(
@@ -48,44 +97,44 @@ def deepseek_chat_messages(
     多轮：system + 若干 user/assistant 顺序消息（通常为历史 + 本条 user）。
     OpenAI Chat Completions 兼容。
     """
-    load_dotenv_if_present()
-    api_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
-    if not api_key:
-        msg = "缺少环境变量 DEEPSEEK_API_KEY（可在项目根目录创建 .env 并填写）"
-        raise ValueError(msg)
-
-    base_url = (os.environ.get("DEEPSEEK_API_BASE") or "https://api.deepseek.com").strip()
-    base_url = base_url.rstrip("/")
-    m = (model or os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash").strip()
-
-    from openai import OpenAI
-
-    kwargs: dict[str, Any] = {"api_key": api_key, "base_url": base_url}
-    client = OpenAI(**kwargs)
-
-    conv: list[dict[str, str]] = []
-    for mo in messages:
-        role = (mo.get("role") or "").strip()
-        raw = mo.get("content")
-        body = raw.strip() if isinstance(raw, str) else str(raw or "").strip()
-        if role not in {"user", "assistant"} or not body:
-            continue
-        conv.append({"role": role, "content": body})
-    req: dict[str, Any] = {
-        "model": m,
-        "messages": [
-            {"role": "system", "content": system_prompt or "You are a helpful assistant."},
-            *conv,
-        ],
-        "temperature": temperature,
-    }
-    if max_tokens is not None:
-        req["max_tokens"] = max_tokens
-
+    client, req = _chat_request(
+        system_prompt,
+        messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
     resp = client.chat.completions.create(**req)
     choice = resp.choices[0].message
     content = getattr(choice, "content", None) or ""
     return content.strip()
+
+
+def deepseek_chat_messages_stream(
+    system_prompt: str,
+    messages: list[dict[str, Any]],
+    *,
+    model: str | None = None,
+    temperature: float = 0.7,
+    max_tokens: int | None = None,
+) -> Iterator[str]:
+    """流式多轮对话，逐段 yield 文本 delta。"""
+    client, req = _chat_request(
+        system_prompt,
+        messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    req["stream"] = True
+    stream = client.chat.completions.create(**req)
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        piece = getattr(delta, "content", None) or ""
+        if piece:
+            yield piece
 
 
 def deepseek_chat_conversation(
@@ -100,6 +149,26 @@ def deepseek_chat_conversation(
     """在多轮上下文 prior_turns（user/assistant 交替片段）末尾追加本条 user_message。"""
     seq: list[dict[str, Any]] = [*prior_turns, {"role": "user", "content": user_message}]
     return deepseek_chat_messages(
+        system_prompt,
+        seq,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+
+def deepseek_chat_conversation_stream(
+    system_prompt: str,
+    prior_turns: list[dict[str, Any]],
+    user_message: str,
+    *,
+    model: str | None = None,
+    temperature: float = 0.7,
+    max_tokens: int | None = None,
+) -> Iterator[str]:
+    """流式：prior_turns + 本条 user_message。"""
+    seq: list[dict[str, Any]] = [*prior_turns, {"role": "user", "content": user_message}]
+    yield from deepseek_chat_messages_stream(
         system_prompt,
         seq,
         model=model,

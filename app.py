@@ -12,6 +12,8 @@ from __future__ import annotations
 import html
 import os
 import uuid
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -29,12 +31,14 @@ from chat_trace import (
     trace_session_start,
 )
 from chat_history import (
+    chat_generation_in_progress,
     create_new_chat,
     default_welcome_messages,
     ensure_chat_histories_initialized,
     list_conversation_cards,
     load_conversation_record,
     persist_active_chat,
+    persist_conversation_record_fields,
     switch_to_chat,
 )
 from trace_restore import (
@@ -621,6 +625,12 @@ def init_state() -> None:
         st.session_state.chat_messages = default_welcome_messages()
     if "jx_active_chat_id" not in st.session_state:
         st.session_state.jx_active_chat_id = str(uuid.uuid4())
+    if "jx_chat_busy" not in st.session_state:
+        st.session_state.jx_chat_busy = False
+    if "jx_chat_pending" not in st.session_state:
+        st.session_state.jx_chat_pending = None
+    if "jx_generation_status" not in st.session_state:
+        st.session_state.jx_generation_status = "idle"
     ensure_chat_histories_initialized(st.session_state)
     for row in st.session_state.experiences:
         if not row.get("_id"):
@@ -722,15 +732,21 @@ if _resume_pdf is not None:
         if rows:
             if should_replace_default_experiences(st.session_state.experiences):
                 st.session_state.experiences = rows
-                st.session_state._pending_active_exp_idx = 0
+                pending_idx = 0
             else:
-                start_len = len(st.session_state.experiences)
+                pending_idx = len(st.session_state.experiences)
                 st.session_state.experiences.extend(rows)
-                st.session_state._pending_active_exp_idx = start_len
+            create_new_chat(st.session_state)
+            st.session_state._pending_active_exp_idx = pending_idx
+            if is_chat_trace_enabled():
+                trace_session_start(
+                    str(st.session_state.jx_trace_session_id),
+                    meta={"app": "工作经历挖掘 streamlit", "source": "resume_pdf_upload"},
+                )
             method = meta.get("extract_method", "")
             n_pdf = len(rows)
             st.session_state["parse_notice"] = (
-                f"已从 PDF 生成 {n_pdf} 段经历卡片（{method}）。可在主区核对、编辑。"
+                f"已从 PDF 生成 {n_pdf} 段经历卡片（{method}），并已开启新对话。可在主区核对、编辑。"
             )
         else:
             note = meta.get("note", "未能得到经历条目。")
@@ -779,25 +795,65 @@ if _sn:
         )
 
 
-def _chat_reply(user_text: str, *, key_ok: bool, focus_idx: int) -> str:
-    from deepseek_api import deepseek_chat_conversation
+@dataclass
+class ChatTurnContext:
+    conversation_id: str
+    display_user: str
+    focus_idx: int
+    key_ok: bool
+    error_reply: str | None = None
+    system: str = ""
+    user_payload: str = ""
+    shadow: list[dict[str, Any]] = field(default_factory=list)
+    shadow_snapshot: list[dict[str, Any]] = field(default_factory=list)
+    cached_hits: list[dict[str, Any]] = field(default_factory=list)
+    experience_snapshot: dict[str, Any] = field(default_factory=dict)
+    first_kb_turn: bool = False
+    temp: float = 0.55
+    ds_model_trace: str = ""
+    sid: str = ""
+    disk_messages: list[dict[str, Any]] = field(default_factory=list)
+    disk_shadow: list[dict[str, Any]] = field(default_factory=list)
+    disk_trace_turn: int = 0
+    disk_active_exp: int = 0
+    disk_kb_anchor: Any = None
+    disk_kb_hits: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _prepare_chat_turn(user_text: str, *, key_ok: bool, focus_idx: int, pending: dict[str, Any]) -> ChatTurnContext:
     from rag.dialogue_guide import build_llm_user_message, load_system_prompt
 
-    sid = str(st.session_state.get("jx_trace_session_id") or "")
+    cid = str(pending.get("chat_id") or st.session_state.get("jx_active_chat_id") or "")
+    sid = cid
+    ctx = ChatTurnContext(
+        conversation_id=cid,
+        display_user=user_text,
+        focus_idx=focus_idx,
+        key_ok=key_ok,
+        sid=sid,
+        disk_messages=[dict(m) for m in (pending.get("messages") or [])],
+        disk_shadow=[dict(m) for m in (pending.get("shadow") or [])],
+        disk_trace_turn=int(pending.get("trace_turn") or 0),
+        disk_active_exp=int(pending.get("active_exp_index") or 0),
+        disk_kb_anchor=pending.get("kb_anchor"),
+        disk_kb_hits=[dict(h) for h in (pending.get("kb_hits") or [])],
+    )
 
     if not key_ok:
         if sid and is_chat_trace_enabled():
             trace_chat_blocked(sid, reason_code="missing_api_key", detail="DEEPSEEK_API_KEY 未配置")
-        return (
+        ctx.error_reply = (
             "未检测到可用的 DeepSeek API Key。"
             "请在项目根目录的 `.env` 中配置 `DEEPSEEK_API_KEY`，然后重新刷新本页。"
         )
+        return ctx
 
     exps = st.session_state.experiences
     if not exps:
         if sid and is_chat_trace_enabled():
             trace_chat_blocked(sid, reason_code="no_experiences", detail="工作经历列表为空")
-        return "当前没有任何经历条目，请用页头「简历导入」上传 PDF，或点击「管理经历」添加后再提问。"
+        ctx.error_reply = "当前没有任何经历条目，请用页头「简历导入」上传 PDF，或点击「管理经历」添加后再提问。"
+        return ctx
 
     idx = max(0, min(focus_idx, len(exps) - 1))
     exp = exps[idx]
@@ -807,16 +863,16 @@ def _chat_reply(user_text: str, *, key_ok: bool, focus_idx: int) -> str:
     d = (exp.get("raw_description") or "").strip()
     blob = f"【当前选中经历 #{idx + 1}】{c} · {r} · {p}\n{d}".strip()[:4000]
     role_hint = r
-    system = load_system_prompt()
-    cached_hits: list[dict[str, Any]] = list(st.session_state.get("jx_kb_top2_hits") or [])
-    shadow: list[dict[str, Any]] = list(st.session_state.get("jx_shadow_messages") or [])
-    first_kb_turn = len(shadow) == 0
-    shadow_snapshot = [
+    ctx.system = load_system_prompt()
+    ctx.cached_hits = list(ctx.disk_kb_hits)
+    ctx.shadow = [dict(m) for m in ctx.disk_shadow]
+    ctx.first_kb_turn = len(ctx.shadow) == 0
+    ctx.shadow_snapshot = [
         {"role": str(m.get("role") or ""), "content": str(m.get("content") or "")}
-        for m in shadow
+        for m in ctx.shadow
         if (m.get("role") or "") in ("user", "assistant") and str(m.get("content") or "").strip()
     ]
-    experience_snapshot = {
+    ctx.experience_snapshot = {
         "experience_index": idx,
         "experience_id": str(exp.get("_id") or ""),
         "company": c,
@@ -825,24 +881,24 @@ def _chat_reply(user_text: str, *, key_ok: bool, focus_idx: int) -> str:
         "raw_description": d,
         "raw_description_chars": len(d),
     }
-    ds_model_trace = ((os.environ.get("DEEPSEEK_MODEL") or "").strip()) or "deepseek-v4-flash"
+    ctx.ds_model_trace = ((os.environ.get("DEEPSEEK_MODEL") or "").strip()) or "deepseek-v4-flash"
 
-    if first_kb_turn:
+    if ctx.first_kb_turn:
         task_hint_init = (
             "请按对话引导文档的风格回应：先倾听、少评判，用澄清式提问帮用户回忆细节；"
             "结合下方「岗位知识库节选」（至多 2 条）中与用户经历相关的差异化指标给出改写方向。不要编造用户未说的事实。"
         )
-        user_payload = build_llm_user_message(
+        ctx.user_payload = build_llm_user_message(
             user_text,
-            cached_hits,
+            ctx.cached_hits,
             experience_snippet=blob,
             job_role=role_hint,
             task_hint=task_hint_init,
             include_rag_kb=True,
             include_experience_snippet=True,
         )
-        if not cached_hits:
-            user_payload += (
+        if not ctx.cached_hits:
+            ctx.user_payload += (
                 "\n\n（说明：本段经历暂未从岗位知识库中匹配到条目。请确认索引已建好，并可回到经历卡补充岗位/原文后再切换一次「对话选用」重试检索。）"
             )
     else:
@@ -850,7 +906,7 @@ def _chat_reply(user_text: str, *, key_ok: bool, focus_idx: int) -> str:
             "延续上一轮已给出的本条经历摘录与岗位知识节选（你已在上文中收到）；"
             "仅针对用户本条新问题回应，可作澄清提问或改写补充；不要编造事实。"
         )
-        user_payload = build_llm_user_message(
+        ctx.user_payload = build_llm_user_message(
             user_text,
             [],
             experience_snippet="",
@@ -859,47 +915,137 @@ def _chat_reply(user_text: str, *, key_ok: bool, focus_idx: int) -> str:
             include_rag_kb=False,
             include_experience_snippet=False,
         )
+    return ctx
 
-    temp = 0.55
+
+def _persist_turn_snapshot(
+    ctx: ChatTurnContext,
+    messages: list[dict[str, Any]],
+    *,
+    shadow: list[dict[str, Any]] | None = None,
+    trace_turn: int | None = None,
+    generation_status: str,
+) -> None:
+    persist_conversation_record_fields(
+        ctx.conversation_id,
+        messages=messages,
+        jx_shadow_messages=shadow if shadow is not None else ctx.disk_shadow,
+        jx_trace_turn_index=trace_turn if trace_turn is not None else ctx.disk_trace_turn,
+        active_exp_index=ctx.disk_active_exp,
+        jx_kb_anchor_key=ctx.disk_kb_anchor,
+        jx_kb_top2_hits=ctx.disk_kb_hits,
+        experiences=list(st.session_state.get("experiences") or []),
+        generation_status=generation_status,
+    )
+
+
+def _stream_chat_turn(ctx: ChatTurnContext) -> Iterator[str]:
+    if ctx.error_reply:
+        yield ctx.error_reply
+        return
+
+    from deepseek_api import deepseek_chat_conversation_stream
+
+    acc: list[str] = []
+    last_persist_len = 0
     try:
-        reply = deepseek_chat_conversation(
-            system,
-            shadow,
-            user_payload,
-            temperature=temp,
-        )
+        for piece in deepseek_chat_conversation_stream(
+            ctx.system,
+            ctx.shadow,
+            ctx.user_payload,
+            temperature=ctx.temp,
+        ):
+            acc.append(piece)
+            full_so_far = "".join(acc)
+            if len(full_so_far) - last_persist_len >= 400:
+                msgs = [*ctx.disk_messages, {"role": "assistant", "content": full_so_far}]
+                _persist_turn_snapshot(ctx, msgs, generation_status="generating")
+                last_persist_len = len(full_so_far)
+            yield piece
     except Exception as e:  # noqa: BLE001
-        if sid and is_chat_trace_enabled():
+        if ctx.sid and is_chat_trace_enabled():
             trace_chat_blocked(
-                sid,
+                ctx.sid,
                 reason_code="chat_api_exception",
                 detail=f"{type(e).__name__}: {e}",
             )
-        return f"调用模型失败：{e}"
-    shadow.append({"role": "user", "content": user_payload})
-    shadow.append({"role": "assistant", "content": reply})
-    st.session_state.jx_shadow_messages = shadow
+        yield f"调用模型失败：{e}"
 
-    if sid and is_chat_trace_enabled():
-        st.session_state.jx_trace_turn_index = int(st.session_state.jx_trace_turn_index or 0) + 1
-        tin = int(st.session_state.jx_trace_turn_index)
+
+def _finalize_chat_turn(ctx: ChatTurnContext, full_reply: str) -> None:
+    shadow = [dict(m) for m in ctx.disk_shadow]
+    if ctx.error_reply is None and ctx.user_payload:
+        shadow.append({"role": "user", "content": ctx.user_payload})
+        shadow.append({"role": "assistant", "content": full_reply})
+
+    trace_turn = ctx.disk_trace_turn
+    if ctx.error_reply is None and ctx.sid and is_chat_trace_enabled():
+        trace_turn = ctx.disk_trace_turn + 1
         trace_chat_turn(
-            sid,
-            turn_index=tin,
-            experience_snapshot=experience_snapshot,
-            display_user=user_text or "",
-            api_shadow_prior=shadow_snapshot,
-            api_user_payload=user_payload,
-            api_assistant=str(reply),
-            system_prompt=system,
-            temperature=temp,
-            first_kb_turn=first_kb_turn,
-            kb_hits=cached_hits,
-            kb_outline=summarize_kb_hits(cached_hits),
-            model=ds_model_trace,
+            ctx.sid,
+            turn_index=trace_turn,
+            experience_snapshot=ctx.experience_snapshot,
+            display_user=ctx.display_user or "",
+            api_shadow_prior=ctx.shadow_snapshot,
+            api_user_payload=ctx.user_payload,
+            api_assistant=str(full_reply),
+            system_prompt=ctx.system,
+            temperature=ctx.temp,
+            first_kb_turn=ctx.first_kb_turn,
+            kb_hits=ctx.cached_hits,
+            kb_outline=summarize_kb_hits(ctx.cached_hits),
+            model=ctx.ds_model_trace,
         )
 
-    return reply
+    final_messages = [*ctx.disk_messages, {"role": "assistant", "content": full_reply}]
+    _persist_turn_snapshot(
+        ctx,
+        final_messages,
+        shadow=shadow,
+        trace_turn=trace_turn,
+        generation_status="idle",
+    )
+
+    if str(st.session_state.get("jx_active_chat_id") or "") == ctx.conversation_id:
+        st.session_state.chat_messages = final_messages
+        st.session_state.jx_shadow_messages = shadow
+        st.session_state.jx_trace_turn_index = trace_turn
+        st.session_state.jx_generation_status = "idle"
+
+
+def _queue_chat_turn(prompt: str, *, key_ok: bool, focus_idx: int) -> None:
+    cid = str(st.session_state.get("jx_active_chat_id") or "")
+    messages = list(st.session_state.get("chat_messages") or [])
+    messages.append({"role": "user", "content": prompt})
+    shadow = [dict(m) for m in (st.session_state.get("jx_shadow_messages") or [])]
+    st.session_state.chat_messages = messages
+    st.session_state.jx_chat_pending = {
+        "prompt": prompt,
+        "focus_idx": focus_idx,
+        "chat_id": cid,
+        "messages": [dict(m) for m in messages],
+        "shadow": shadow,
+        "trace_turn": int(st.session_state.get("jx_trace_turn_index") or 0),
+        "active_exp_index": int(st.session_state.get("active_exp_index") or 0),
+        "kb_anchor": st.session_state.get("jx_kb_anchor_key"),
+        "kb_hits": [dict(h) for h in (st.session_state.get("jx_kb_top2_hits") or [])],
+    }
+    st.session_state.jx_chat_busy = True
+    st.session_state.jx_generation_status = "generating"
+    ctx_stub = ChatTurnContext(
+        conversation_id=cid,
+        display_user=prompt,
+        focus_idx=focus_idx,
+        key_ok=key_ok,
+        disk_messages=[dict(m) for m in messages],
+        disk_shadow=shadow,
+        disk_trace_turn=int(st.session_state.get("jx_trace_turn_index") or 0),
+        disk_active_exp=int(st.session_state.get("active_exp_index") or 0),
+        disk_kb_anchor=st.session_state.get("jx_kb_anchor_key"),
+        disk_kb_hits=[dict(h) for h in (st.session_state.get("jx_kb_top2_hits") or [])],
+    )
+    _persist_turn_snapshot(ctx_stub, messages, generation_status="generating")
+    st.rerun()
 
 
 def _experience_card_title(i: int, exp: dict[str, Any]) -> str:
@@ -938,12 +1084,21 @@ def _render_experience_card(i: int, exp: dict[str, Any]) -> None:
 
 
 def _render_chat_history_panel(*, in_sidebar: bool = False) -> None:
+    busy = chat_generation_in_progress(st.session_state)
     st.markdown("##### 对话历史")
     if in_sidebar:
         st.caption("本机已保存；点选切换会话。")
     else:
         st.caption("每条卡片对应本机一条已保存对话。")
-    if st.button("＋ 新对话", key="jx_new_chat_btn", use_container_width=True, type="primary"):
+    if busy:
+        st.caption("模型回复生成中，请稍候再切换对话。")
+    if st.button(
+        "＋ 新对话",
+        key="jx_new_chat_btn",
+        use_container_width=True,
+        type="primary",
+        disabled=busy,
+    ):
         create_new_chat(st.session_state)
         if is_chat_trace_enabled():
             trace_session_start(
@@ -976,17 +1131,34 @@ def _render_chat_history_panel(*, in_sidebar: bool = False) -> None:
             use_container_width=True,
             type="primary" if is_active else "secondary",
             help=tip,
+            disabled=busy,
         ):
             if switch_to_chat(st.session_state, hid):
                 st.rerun()
+            elif busy:
+                st.warning("模型正在回复，请等待完成后再切换。")
 
 
 @st.fragment
-def _render_chat_messages() -> None:
+def _render_chat_messages(*, key_ok: bool) -> None:
     with st.container(border=False, key="jx_chat_scroll"):
         for msg in st.session_state.chat_messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
+        pending = st.session_state.get("jx_chat_pending")
+        if st.session_state.get("jx_chat_busy") and pending:
+            ctx = _prepare_chat_turn(
+                str(pending.get("prompt") or ""),
+                key_ok=key_ok,
+                focus_idx=int(pending.get("focus_idx") or 0),
+                pending=pending,
+            )
+            with st.chat_message("assistant"):
+                full = st.write_stream(_stream_chat_turn(ctx))
+            _finalize_chat_turn(ctx, str(full or ""))
+            st.session_state.jx_chat_busy = False
+            st.session_state.jx_chat_pending = None
+            st.rerun()
 
 
 def _pin_chat_input_bar() -> None:
@@ -1027,15 +1199,14 @@ def _pin_chat_input_bar() -> None:
 
 
 def _render_chat_input_bar(*, key_ok: bool) -> None:
+    busy = chat_generation_in_progress(st.session_state)
     idx = effective_active_exp_index()
     with st.container(key="jx_chat_input_bar"):
-        if prompt := st.chat_input("输入消息，与 AI 一起挖掘、润色经历…"):
-            st.session_state.chat_messages.append({"role": "user", "content": prompt})
-            with st.spinner("思考中…"):
-                reply = _chat_reply(prompt, key_ok=key_ok, focus_idx=idx)
-            st.session_state.chat_messages.append({"role": "assistant", "content": reply})
-            persist_active_chat(st.session_state)
-            st.rerun()
+        if prompt := st.chat_input(
+            "输入消息，与 AI 一起挖掘、润色经历…",
+            disabled=busy,
+        ):
+            _queue_chat_turn(prompt, key_ok=key_ok, focus_idx=idx)
     _pin_chat_input_bar()
 
 
@@ -1138,5 +1309,5 @@ else:
             ):
                 _render_experience_card(_j, _exp_row)
 
-_render_chat_messages()
+_render_chat_messages(key_ok=_key_ok)
 _render_chat_input_bar(key_ok=_key_ok)

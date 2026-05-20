@@ -127,24 +127,93 @@ def snapshot_from_session(ss: Any) -> dict[str, Any]:
         anchor_serial = None
 
     messages = list(ss.get("chat_messages") or [])
+    return build_conversation_record(
+        cid,
+        messages=messages,
+        jx_shadow_messages=list(ss.get("jx_shadow_messages") or []),
+        jx_trace_turn_index=int(ss.get("jx_trace_turn_index") or 0),
+        active_exp_index=int(ss.get("active_exp_index") or 0),
+        jx_kb_anchor_key=anchor_serial,
+        jx_kb_top2_hits=[dict(h) for h in (ss.get("jx_kb_top2_hits") or [])],
+        experiences=list(ss.get("experiences") or []),
+        generation_status=str(ss.get("jx_generation_status") or "idle"),
+    )
+
+
+def _serialize_kb_anchor(anchor: Any) -> list[Any] | None:
+    if anchor is None:
+        return None
+    if isinstance(anchor, (list, tuple)) and len(anchor) >= 2:
+        return [int(anchor[0]), str(anchor[1])]
+    return None
+
+
+def build_conversation_record(
+    conversation_id: str,
+    *,
+    messages: list[dict[str, Any]],
+    jx_shadow_messages: list[dict[str, Any]],
+    jx_trace_turn_index: int,
+    active_exp_index: int,
+    jx_kb_anchor_key: list[Any] | tuple[Any, ...] | None,
+    jx_kb_top2_hits: list[dict[str, Any]],
+    experiences: list[dict[str, Any]] | None = None,
+    generation_status: str = "idle",
+) -> dict[str, Any]:
+    """按 conversation id 组装可落盘记录（不依赖当前 active 会话）。"""
+    cid = (conversation_id or "").strip()
+    anchor_serial = _serialize_kb_anchor(jx_kb_anchor_key)
+    msgs = [dict(m) for m in messages]
     return {
         "id": cid,
         "title": chat_title_from_state(
-            messages,
-            experiences=list(ss.get("experiences") or []),
-            active_exp_index=int(ss.get("active_exp_index") or 0),
+            msgs,
+            experiences=experiences or [],
+            active_exp_index=active_exp_index,
         ),
-        "preview": chat_preview_from_messages(messages),
+        "preview": chat_preview_from_messages(msgs),
         "updated_at": float(time.time()),
-        "turn_count": sum(1 for m in messages if (m.get("role") or "") == "user"),
-        "chat_messages": [dict(m) for m in messages],
-        "jx_shadow_messages": [dict(m) for m in (ss.get("jx_shadow_messages") or [])],
+        "turn_count": sum(1 for m in msgs if (m.get("role") or "") == "user"),
+        "chat_messages": msgs,
+        "jx_shadow_messages": [dict(m) for m in jx_shadow_messages],
         "jx_trace_session_id": cid,
-        "jx_trace_turn_index": int(ss.get("jx_trace_turn_index") or 0),
-        "active_exp_index": int(ss.get("active_exp_index") or 0),
+        "jx_trace_turn_index": int(jx_trace_turn_index),
+        "active_exp_index": int(active_exp_index),
         "jx_kb_anchor_key": anchor_serial,
-        "jx_kb_top2_hits": [dict(h) for h in (ss.get("jx_kb_top2_hits") or [])],
+        "jx_kb_top2_hits": [dict(h) for h in jx_kb_top2_hits],
+        "generation_status": generation_status,
     }
+
+
+def persist_conversation_record_fields(
+    conversation_id: str,
+    *,
+    messages: list[dict[str, Any]],
+    jx_shadow_messages: list[dict[str, Any]],
+    jx_trace_turn_index: int,
+    active_exp_index: int,
+    jx_kb_anchor_key: Any,
+    jx_kb_top2_hits: list[dict[str, Any]],
+    experiences: list[dict[str, Any]] | None = None,
+    generation_status: str = "idle",
+) -> None:
+    """将指定会话写入本地 JSON（用于流式生成中与生成结束后落盘）。"""
+    rec = build_conversation_record(
+        conversation_id,
+        messages=messages,
+        jx_shadow_messages=jx_shadow_messages,
+        jx_trace_turn_index=jx_trace_turn_index,
+        active_exp_index=active_exp_index,
+        jx_kb_anchor_key=jx_kb_anchor_key,
+        jx_kb_top2_hits=jx_kb_top2_hits,
+        experiences=experiences,
+        generation_status=generation_status,
+    )
+    save_conversation_record(rec)
+
+
+def chat_generation_in_progress(ss: Any) -> bool:
+    return bool(ss.get("jx_chat_busy"))
 
 
 def save_conversation_record(record: dict[str, Any]) -> None:
@@ -418,11 +487,15 @@ def switch_to_chat(ss: Any, chat_id: str) -> bool:
     chat_id = (chat_id or "").strip()
     if not chat_id or chat_id == str(ss.get("jx_active_chat_id") or ""):
         return False
+    if chat_generation_in_progress(ss):
+        return False
     persist_active_chat(ss)
     return _load_conversation_into_session(ss, chat_id)
 
 
 def create_new_chat(ss: Any) -> str:
+    if chat_generation_in_progress(ss):
+        return str(ss.get("jx_active_chat_id") or "")
     persist_active_chat(ss)
     new_id = str(uuid.uuid4())
     ss.jx_active_chat_id = new_id
