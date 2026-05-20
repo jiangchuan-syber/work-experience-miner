@@ -1,0 +1,12 @@
+streamlit>=1.40.0
+pymupdf>=1.24.0
+# PaddleOCR（中文简历 OCR，需先安装 paddlepaddle，见 README）
+paddleocr>=2.7.0
+opencv-python-headless>=4.8.0,<4.11
+# 可选回退：OCR_ENGINE=tesseract 时使用
+pytesseract>=0.3.10
+Pillow>=10.0.0
+chromadb>=0.4.22
+sentence-transformers>=2.2.0
+openai>=1.40.0
+python-dotenv>=1.0.0

@@ -1,0 +1,8 @@
+.env
+.chroma_job_kb/
+local_chat_traces/
+local_chat_histories/
+
+__pycache__/
+*.py[cod]
+_ui_screenshots/
