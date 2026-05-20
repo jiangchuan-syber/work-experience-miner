@@ -682,6 +682,7 @@ _export_md = build_markdown_export(
 _hdr_title, _hdr_actions = st.columns([4, 2], vertical_alignment="center")
 with _hdr_title:
     st.title("工作经历挖掘")
+_resume_pdf = None
 with _hdr_actions:
     _hdr_import, _hdr_export = st.columns(2, gap="small")
     with _hdr_import:
@@ -1125,7 +1126,7 @@ with st.container(key="exp_sticky_header"):
 
 if not _elist:
     st.info(
-        '暂无经历。请使用侧栏「简历导入」，或点击「管理经历」添加一段。',
+        '暂无经历。请使用页头「简历导入」上传 PDF，或点击「管理经历」添加一段。',
     )
 else:
     _act_idx = effective_active_exp_index()
